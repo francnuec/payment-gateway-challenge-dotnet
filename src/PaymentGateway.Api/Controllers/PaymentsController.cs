@@ -27,14 +27,9 @@ public class PaymentsController : Controller
     }
 
     [HttpGet("{id:guid}")]
-    public async Task<ActionResult<PostPaymentResponse?>> GetPaymentAsync(Guid id)
+    public ActionResult<PostPaymentResponse?> GetPayment(Guid id)
     {
-        if (_paymentsRepository.Get(id) is PostPaymentResponse payment)
-        {
-            return Ok(payment);
-        }
-
-        return NotFound();
+        return _paymentsRepository.Get(id) is PostPaymentResponse payment ? Ok(payment) : NotFound();
     }
 
     [HttpPost]

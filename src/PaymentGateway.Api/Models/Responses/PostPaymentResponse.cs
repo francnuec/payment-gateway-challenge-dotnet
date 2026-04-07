@@ -2,14 +2,10 @@ using System.Text.Json.Serialization;
 
 namespace PaymentGateway.Api.Models.Responses;
 
-public class PostPaymentResponse
+public class PostPaymentResponse : PaymentResponseBase
 {
     [JsonPropertyName("id")]
     public Guid Id { get; set; }
-
-    [JsonPropertyName("status")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public PaymentStatus Status { get; set; }
 
     [JsonPropertyName("card_number_last_four")]
     public string CardNumberLastFour { get; set; } = string.Empty;

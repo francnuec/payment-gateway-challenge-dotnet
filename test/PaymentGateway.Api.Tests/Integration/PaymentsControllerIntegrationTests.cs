@@ -53,6 +53,10 @@ public class PaymentsControllerIntegrationTests
         Cvv = "123"
     };
 
+    // ──────────────────────────────────────────────────────────────────────
+    // POST /api/Payments — Authorized / Declined (bank returned 200)
+    // ──────────────────────────────────────────────────────────────────────
+
     [Fact]
     public async Task PostPayment_WithAuthorizedCard_Returns200WithAuthorized()
     {
@@ -66,6 +70,7 @@ public class PaymentsControllerIntegrationTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.NotNull(payment);
         Assert.Equal(PaymentStatus.Authorized, payment!.Status);
+        Assert.Null(payment.Errors); // successful payments have no errors
         Assert.NotEqual(Guid.Empty, payment.Id);
         Assert.Equal("8877", payment.CardNumberLastFour);
         Assert.Equal(request.Currency, payment.Currency);
@@ -87,24 +92,48 @@ public class PaymentsControllerIntegrationTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.NotNull(payment);
         Assert.Equal(PaymentStatus.Declined, payment!.Status);
+        Assert.Null(payment.Errors);
         Assert.Equal("8112", payment.CardNumberLastFour);
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    // POST /api/Payments — Bank error responses (4xx, 5xx)
+    // ──────────────────────────────────────────────────────────────────────
+
     [Fact]
-    public async Task PostPayment_WhenBankReturnsError_Returns200WithDeclined()
+    public async Task PostPayment_WhenBankReturns5xx_Returns502BadGateway()
     {
-        // Card ending in 0 -> bank returns 503. The gateway treats any non-authorized
-        // bank response as Declined — the three-status model doesn't need a fourth value.
+        // Card ending in 0 -> bank returns 503. The gateway surfaces this as 502
+        // because the failure is upstream — the client should retry later.
         var client = CreateClient();
         var request = CreateValidRequest("2222405343248870");
 
         var response = await client.PostAsJsonAsync("/api/Payments", request);
-        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.NotNull(payment);
-        Assert.Equal(PaymentStatus.Declined, payment!.Status);
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
     }
+
+    [Fact]
+    public async Task PostPayment_WhenBankReturns4xx_Returns400WithRejected()
+    {
+        // Card starting with "0" -> bank returns 400 (test-only simulator rule).
+        // The gateway relays this as 400 Bad Request with a Rejected status.
+        var client = CreateClient();
+        var request = CreateValidRequest("01234567890123");
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var result = await response.Content.ReadFromJsonAsync<PaymentResponseBase>();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotNull(result);
+        Assert.Equal(PaymentStatus.Rejected, result!.Status);
+        Assert.NotNull(result.Errors);
+        Assert.NotEmpty(result.Errors!);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // POST /api/Payments — Validation failures (Rejected)
+    // ──────────────────────────────────────────────────────────────────────
 
     [Theory]
     [InlineData("12345", "GBP", "123")]           // card number too short (5 chars, min 14)
@@ -114,7 +143,7 @@ public class PaymentsControllerIntegrationTests
     [InlineData("22224053432488", "GBP", "12")]    // CVV too short (2 chars, min 3)
     [InlineData("22224053432488", "GBP", "12345")] // CVV too long (5 chars, max 4)
     [InlineData("22224053432488", "GBP", "abc")]   // CVV contains non-numeric characters
-    public async Task PostPayment_WithInvalidData_Returns400WithRejected(
+    public async Task PostPayment_WithInvalidData_Returns400WithRejectedAndErrors(
         string cardNumber, string currency, string cvv)
     {
         var client = CreateClient();
@@ -129,15 +158,17 @@ public class PaymentsControllerIntegrationTests
         };
 
         var response = await client.PostAsJsonAsync("/api/Payments", request);
-        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+        var result = await response.Content.ReadFromJsonAsync<PaymentResponseBase>();
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.NotNull(payment);
-        Assert.Equal(PaymentStatus.Rejected, payment!.Status);
+        Assert.NotNull(result);
+        Assert.Equal(PaymentStatus.Rejected, result!.Status);
+        Assert.NotNull(result.Errors);
+        Assert.NotEmpty(result.Errors!);
     }
 
     [Fact]
-    public async Task PostPayment_WithExpiredDate_Returns400WithRejected()
+    public async Task PostPayment_WithExpiredDate_Returns400WithRejectedAndErrors()
     {
         var client = CreateClient();
         var request = new PostPaymentRequest
@@ -151,12 +182,47 @@ public class PaymentsControllerIntegrationTests
         };
 
         var response = await client.PostAsJsonAsync("/api/Payments", request);
-        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+        var result = await response.Content.ReadFromJsonAsync<PaymentResponseBase>();
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.NotNull(payment);
-        Assert.Equal(PaymentStatus.Rejected, payment!.Status);
+        Assert.NotNull(result);
+        Assert.Equal(PaymentStatus.Rejected, result!.Status);
+        Assert.NotNull(result.Errors);
+        Assert.NotEmpty(result.Errors!);
     }
+
+    [Fact]
+    public async Task PostPayment_RejectedResponse_DoesNotContainPaymentFields()
+    {
+        // Rejected responses should only have status + errors, not payment-specific
+        // fields like id, card_number_last_four, etc. Deserializing as PostPaymentResponse
+        // should leave those fields at their defaults.
+        var client = CreateClient();
+        var request = new PostPaymentRequest
+        {
+            CardNumber = "12345",
+            ExpiryMonth = 12,
+            ExpiryYear = DateTime.UtcNow.Year + 1,
+            Currency = "GBP",
+            Amount = 100,
+            Cvv = "123"
+        };
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var result = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotNull(result);
+        // These fields should be absent from a rejected response (defaults for their types)
+        Assert.Equal(Guid.Empty, result!.Id);
+        Assert.Equal(string.Empty, result.CardNumberLastFour);
+        Assert.Equal(string.Empty, result.Currency);
+        Assert.Equal(0, result.Amount);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // GET /api/Payments/{id} — Retrieve stored payments
+    // ──────────────────────────────────────────────────────────────────────
 
     [Fact]
     public async Task GetPayment_AfterSuccessfulPost_ReturnsStoredPayment()
@@ -182,6 +248,7 @@ public class PaymentsControllerIntegrationTests
         Assert.Equal(posted.ExpiryYear, retrieved.ExpiryYear);
         Assert.Equal(posted.Currency, retrieved.Currency);
         Assert.Equal(posted.Amount, retrieved.Amount);
+        Assert.Null(retrieved.Errors); // stored payments have no errors
     }
 
     [Fact]

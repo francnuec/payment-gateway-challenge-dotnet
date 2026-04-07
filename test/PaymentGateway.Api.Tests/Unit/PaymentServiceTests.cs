@@ -75,19 +75,36 @@ public class PaymentServiceTests
     }
 
     [Fact]
-    public async Task ProcessPayment_WhenBankReturnsServerError_ReturnsDeclined()
+    public async Task ProcessPayment_WhenBankReturns5xx_ThrowsBankErrorException()
     {
-        // Bank errors (e.g., 503 for card ending in 0) mean the bank did not authorize.
-        // We treat any non-success bank response as Declined rather than introducing a
-        // fourth status — the spec only defines Authorized, Declined, and Rejected.
+        // Bank server errors (e.g., 503) are surfaced as BankErrorException so the
+        // controller can return 502 Bad Gateway to the client.
         var handler = new MockHttpMessageHandler((_, _) =>
             Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)));
 
         var service = CreateService(handler);
-        var result = await service.ProcessPaymentAsync(
-            CreateValidRequest("2222405343248870"), CancellationToken.None);
 
-        Assert.Equal(PaymentStatus.Declined, result.Status);
+        var ex = await Assert.ThrowsAsync<BankErrorException>(
+            () => service.ProcessPaymentAsync(
+                CreateValidRequest("2222405343248870"), CancellationToken.None));
+
+        Assert.Equal(503, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task ProcessPayment_WhenBankReturns4xx_ThrowsBankErrorException()
+    {
+        // Bank client errors (e.g., 400) are surfaced as BankErrorException so the
+        // controller can return 400 Bad Request to the client.
+        var handler = new MockHttpMessageHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)));
+
+        var service = CreateService(handler);
+
+        var ex = await Assert.ThrowsAsync<BankErrorException>(
+            () => service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None));
+
+        Assert.Equal(400, ex.StatusCode);
     }
 
     [Fact]

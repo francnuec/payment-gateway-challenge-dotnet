@@ -39,23 +39,30 @@ public class PaymentsController : ControllerBase
     }
 
     [HttpPost]
-    public async Task<ActionResult<PostPaymentResponse>> PostPayment(
+    public async Task<IActionResult> PostPayment(
         [FromBody] PostPaymentRequest request,
         CancellationToken cancellationToken)
     {
         if (!ModelState.IsValid)
         {
-            var rejected = BuildRejectedResponse(request);
+            var errors = ModelState.Values
+                .SelectMany(v => v.Errors)
+                .Select(e => e.ErrorMessage)
+                .Where(e => !string.IsNullOrEmpty(e))
+                .ToList();
 
             // Structured logging with named parameters enables filtering and alerting
             // in log aggregation tools (e.g., Datadog, Seq, Application Insights).
-            _logger.LogWarning("Payment {PaymentId} rejected: {ValidationErrors}",
-                rejected.Id,
-                string.Join("; ", ModelState.Values
-                    .SelectMany(v => v.Errors)
-                    .Select(e => e.ErrorMessage)));
+            _logger.LogWarning("Payment rejected: {ValidationErrors}",
+                string.Join("; ", errors));
 
-            return BadRequest(rejected);
+            // Rejected responses return only status + errors (no payment ID or card details)
+            // since the payment was never processed.
+            return BadRequest(new PaymentResponseBase
+            {
+                Status = PaymentStatus.Rejected,
+                Errors = errors
+            });
         }
 
         try
@@ -64,30 +71,19 @@ public class PaymentsController : ControllerBase
             _paymentsRepository.Add(result);
             return Ok(result);
         }
-        catch (HttpRequestException ex)
+        catch (BankErrorException ex) when (ex.StatusCode >= 400 && ex.StatusCode < 500)
         {
-            // Bank is unreachable or returned a network-level error. Return 502 so the
-            // client knows the failure is upstream, not in our validation or logic.
-            _logger.LogError(ex, "Bank communication failure while processing payment");
+            // Bank rejected the request data — already logged by PaymentService.
+            return BadRequest(new PaymentResponseBase
+            {
+                Status = PaymentStatus.Rejected,
+                Errors = new List<string> { "One or more fields have invalid values" }
+            });
+        }
+        catch (Exception ex) when (ex is BankErrorException or HttpRequestException)
+        {
+            // Bank 5xx or network failure — already logged by PaymentService.
             return StatusCode(StatusCodes.Status502BadGateway);
         }
     }
-
-    /// <summary>
-    /// Builds a Rejected response for invalid requests. Guards against null/short card
-    /// numbers since model binding runs before validation — the action still executes
-    /// because we suppressed the automatic ModelState invalid filter.
-    /// </summary>
-    private static PostPaymentResponse BuildRejectedResponse(PostPaymentRequest request) => new()
-    {
-        Id = Guid.NewGuid(),
-        Status = PaymentStatus.Rejected,
-        CardNumberLastFour = request.CardNumber?.Length >= 4
-            ? request.CardNumber[^4..]
-            : request.CardNumber ?? string.Empty,
-        ExpiryMonth = request.ExpiryMonth,
-        ExpiryYear = request.ExpiryYear,
-        Currency = request.Currency ?? string.Empty,
-        Amount = request.Amount
-    };
 }

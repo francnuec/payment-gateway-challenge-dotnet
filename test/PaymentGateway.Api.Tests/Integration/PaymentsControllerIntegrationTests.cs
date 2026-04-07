@@ -1,0 +1,196 @@
+using System.Net;
+using System.Net.Http.Json;
+
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+
+using PaymentGateway.Api.Models;
+using PaymentGateway.Api.Models.Requests;
+using PaymentGateway.Api.Models.Responses;
+using PaymentGateway.Api.Services;
+using PaymentGateway.Api.Tests.Helpers;
+
+namespace PaymentGateway.Api.Tests.Integration;
+
+/// <summary>
+/// Integration tests verify the full HTTP pipeline end-to-end: routing, model binding,
+/// validation, service orchestration, repository storage, and JSON serialization.
+///
+/// These complement unit tests by catching wiring issues between components that unit
+/// tests cannot detect (e.g., missing DI registrations, incorrect route templates,
+/// serialization mismatches).
+///
+/// A fake bank handler (BankSimulatorHandler) replaces the real bank API so these
+/// tests run without Docker. This is deliberate — integration tests should verify
+/// our code's behavior, not the bank simulator's correctness.
+/// </summary>
+public class PaymentsControllerIntegrationTests
+{
+    private static HttpClient CreateClient()
+    {
+        var factory = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.ConfigureTestServices(services =>
+                {
+                    // Replace the real bank HTTP client with our in-process simulator.
+                    services.AddHttpClient<IPaymentService, PaymentService>()
+                        .ConfigurePrimaryHttpMessageHandler(() => new BankSimulatorHandler());
+                });
+            });
+
+        return factory.CreateClient();
+    }
+
+    private static PostPaymentRequest CreateValidRequest(string cardNumber = "2222405343248877") => new()
+    {
+        CardNumber = cardNumber,
+        ExpiryMonth = 12,
+        ExpiryYear = DateTime.UtcNow.Year + 1,
+        Currency = "GBP",
+        Amount = 100,
+        Cvv = "123"
+    };
+
+    [Fact]
+    public async Task PostPayment_WithAuthorizedCard_Returns200WithAuthorized()
+    {
+        // Card ending in 7 (odd) -> bank returns authorized=true
+        var client = CreateClient();
+        var request = CreateValidRequest("2222405343248877");
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.NotNull(payment);
+        Assert.Equal(PaymentStatus.Authorized, payment!.Status);
+        Assert.NotEqual(Guid.Empty, payment.Id);
+        Assert.Equal("8877", payment.CardNumberLastFour);
+        Assert.Equal(request.Currency, payment.Currency);
+        Assert.Equal(request.Amount, payment.Amount);
+        Assert.Equal(request.ExpiryMonth, payment.ExpiryMonth);
+        Assert.Equal(request.ExpiryYear, payment.ExpiryYear);
+    }
+
+    [Fact]
+    public async Task PostPayment_WithDeclinedCard_Returns200WithDeclined()
+    {
+        // Card ending in 2 (even) -> bank returns authorized=false
+        var client = CreateClient();
+        var request = CreateValidRequest("2222405343248112");
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.NotNull(payment);
+        Assert.Equal(PaymentStatus.Declined, payment!.Status);
+        Assert.Equal("8112", payment.CardNumberLastFour);
+    }
+
+    [Fact]
+    public async Task PostPayment_WhenBankReturnsError_Returns200WithDeclined()
+    {
+        // Card ending in 0 -> bank returns 503. The gateway treats any non-authorized
+        // bank response as Declined — the three-status model doesn't need a fourth value.
+        var client = CreateClient();
+        var request = CreateValidRequest("2222405343248870");
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.NotNull(payment);
+        Assert.Equal(PaymentStatus.Declined, payment!.Status);
+    }
+
+    [Theory]
+    [InlineData("12345", "GBP", "123")]           // card number too short (5 chars, min 14)
+    [InlineData("12345678901234567890", "GBP", "123")] // card number too long (20 chars, max 19)
+    [InlineData("abcdefghijklmn", "GBP", "123")]  // card number contains non-numeric characters
+    [InlineData("22224053432488", "XYZ", "123")]   // unsupported currency
+    [InlineData("22224053432488", "GBP", "12")]    // CVV too short (2 chars, min 3)
+    [InlineData("22224053432488", "GBP", "12345")] // CVV too long (5 chars, max 4)
+    [InlineData("22224053432488", "GBP", "abc")]   // CVV contains non-numeric characters
+    public async Task PostPayment_WithInvalidData_Returns400WithRejected(
+        string cardNumber, string currency, string cvv)
+    {
+        var client = CreateClient();
+        var request = new PostPaymentRequest
+        {
+            CardNumber = cardNumber,
+            ExpiryMonth = 12,
+            ExpiryYear = DateTime.UtcNow.Year + 1,
+            Currency = currency,
+            Amount = 100,
+            Cvv = cvv
+        };
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotNull(payment);
+        Assert.Equal(PaymentStatus.Rejected, payment!.Status);
+    }
+
+    [Fact]
+    public async Task PostPayment_WithExpiredDate_Returns400WithRejected()
+    {
+        var client = CreateClient();
+        var request = new PostPaymentRequest
+        {
+            CardNumber = "2222405343248877",
+            ExpiryMonth = 1,
+            ExpiryYear = 2020,
+            Currency = "GBP",
+            Amount = 100,
+            Cvv = "123"
+        };
+
+        var response = await client.PostAsJsonAsync("/api/Payments", request);
+        var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.NotNull(payment);
+        Assert.Equal(PaymentStatus.Rejected, payment!.Status);
+    }
+
+    [Fact]
+    public async Task GetPayment_AfterSuccessfulPost_ReturnsStoredPayment()
+    {
+        // Round-trip test: POST a payment, then GET it back by ID.
+        // Verifies the full write-then-read path through the pipeline.
+        var client = CreateClient();
+        var request = CreateValidRequest();
+
+        var postResponse = await client.PostAsJsonAsync("/api/Payments", request);
+        var posted = await postResponse.Content.ReadFromJsonAsync<PostPaymentResponse>();
+        Assert.NotNull(posted);
+
+        var getResponse = await client.GetAsync($"/api/Payments/{posted!.Id}");
+        var retrieved = await getResponse.Content.ReadFromJsonAsync<PostPaymentResponse>();
+
+        Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
+        Assert.NotNull(retrieved);
+        Assert.Equal(posted.Id, retrieved!.Id);
+        Assert.Equal(posted.Status, retrieved.Status);
+        Assert.Equal(posted.CardNumberLastFour, retrieved.CardNumberLastFour);
+        Assert.Equal(posted.ExpiryMonth, retrieved.ExpiryMonth);
+        Assert.Equal(posted.ExpiryYear, retrieved.ExpiryYear);
+        Assert.Equal(posted.Currency, retrieved.Currency);
+        Assert.Equal(posted.Amount, retrieved.Amount);
+    }
+
+    [Fact]
+    public async Task GetPayment_WithNonExistentId_Returns404()
+    {
+        var client = CreateClient();
+
+        var response = await client.GetAsync($"/api/Payments/{Guid.NewGuid()}");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+}

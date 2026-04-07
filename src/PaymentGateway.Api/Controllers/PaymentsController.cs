@@ -1,8 +1,6 @@
-﻿using System.Net;
-
 using Microsoft.AspNetCore.Mvc;
 
-using PaymentGateway.Api.Filters;
+using PaymentGateway.Api.Models;
 using PaymentGateway.Api.Models.Requests;
 using PaymentGateway.Api.Models.Responses;
 using PaymentGateway.Api.Services;
@@ -11,103 +9,85 @@ namespace PaymentGateway.Api.Controllers;
 
 [Route("api/[controller]")]
 [ApiController]
-[PacketFilter]
-public class PaymentsController : Controller
+public class PaymentsController : ControllerBase
 {
+    private readonly IPaymentService _paymentService;
+    private readonly IPaymentsRepository _paymentsRepository;
     private readonly ILogger<PaymentsController> _logger;
-    private readonly string _bankPaymentsEndpoint;
-    private readonly HttpClient _httpClient = new HttpClient();
-    private readonly PaymentsRepository _paymentsRepository;
 
-    public PaymentsController(ILogger<PaymentsController> logger, IConfiguration configuration, PaymentsRepository paymentsRepository)
+    public PaymentsController(
+        IPaymentService paymentService,
+        IPaymentsRepository paymentsRepository,
+        ILogger<PaymentsController> logger)
     {
-        _logger = logger;
-        _bankPaymentsEndpoint = configuration.GetValue<string>("BankPaymentsEndpoint") ?? throw new Exception("Bank payments endpoint required.");
+        _paymentService = paymentService;
         _paymentsRepository = paymentsRepository;
+        _logger = logger;
     }
 
     [HttpGet("{id:guid}")]
-    public ActionResult<PostPaymentResponse?> GetPayment(Guid id)
+    public ActionResult<PostPaymentResponse> GetPayment(Guid id)
     {
-        return _paymentsRepository.Get(id) is PostPaymentResponse payment ? Ok(payment) : NotFound();
+        var payment = _paymentsRepository.Get(id);
+        if (payment is null)
+        {
+            _logger.LogInformation("Payment {PaymentId} not found", id);
+            return NotFound();
+        }
+
+        return Ok(payment);
     }
 
     [HttpPost]
-    [SuppressModelStateInvalidFilter]
-    public async Task<ActionResult<PostPaymentResponse?>> PostPaymentAsync([FromBody] PostPaymentRequest postPaymentRequest, CancellationToken cancellationToken)
+    public async Task<ActionResult<PostPaymentResponse>> PostPayment(
+        [FromBody] PostPaymentRequest request,
+        CancellationToken cancellationToken)
     {
-        var payment = new PostPaymentResponse()
+        if (!ModelState.IsValid)
         {
-            Id = Guid.NewGuid(),
-            Status = Models.PaymentStatus.Rejected, // assume rejected by default until we hit the bank api
-            CardNumberLastFour = postPaymentRequest.CardNumber[^4..],
-            ExpiryMonth = postPaymentRequest.ExpiryMonth,
-            ExpiryYear = postPaymentRequest.ExpiryYear,
-            Currency = postPaymentRequest.Currency,
-            Amount = postPaymentRequest.Amount
-        };
+            var rejected = BuildRejectedResponse(request);
+
+            // Structured logging with named parameters enables filtering and alerting
+            // in log aggregation tools (e.g., Datadog, Seq, Application Insights).
+            _logger.LogWarning("Payment {PaymentId} rejected: {ValidationErrors}",
+                rejected.Id,
+                string.Join("; ", ModelState.Values
+                    .SelectMany(v => v.Errors)
+                    .Select(e => e.ErrorMessage)));
+
+            return BadRequest(rejected);
+        }
 
         try
         {
-            if (ModelState.IsValid)
-            {
-                var bankPaymentRequest = new BankPaymentRequest()
-                {
-                    CardNumber = postPaymentRequest.CardNumber,
-                    ExpiryDate = $"{postPaymentRequest.ExpiryMonth.ToString("D2")}/{postPaymentRequest.ExpiryYear}",
-                    Currency = postPaymentRequest.Currency,
-                    Amount = postPaymentRequest.Amount,
-                    Cvv = postPaymentRequest.Cvv
-                };
-
-                var bankPaymentsResponse = await _httpClient.PostAsJsonAsync(_bankPaymentsEndpoint, bankPaymentRequest, cancellationToken);
-                var bankPaymentsStatusCode = (int)bankPaymentsResponse.StatusCode;
-
-                payment.Status = Models.PaymentStatus.Declined; // assume declined because we have hit the bank api
-
-                if (bankPaymentsResponse.IsSuccessStatusCode
-                    && await bankPaymentsResponse.Content.ReadFromJsonAsync<BankPaymentResponse>(cancellationToken) is BankPaymentResponse responseContent)
-                {
-                    if (responseContent.Authorized)
-                    {
-                        payment.Status = Models.PaymentStatus.Authorized;
-                    }
-
-                    return Ok(payment);
-                }
-                else if (bankPaymentsStatusCode == 400)
-                {
-                    // an unaccepted card detail was sent
-                    // refuse with 403 - Forbidden so that the client knows not to retry
-                    return StatusCode((int)HttpStatusCode.Forbidden, payment);
-                }
-                else if (bankPaymentsStatusCode >= 500)
-                {
-                    // something went wrong at the bank
-                    // return a 502 - Bad Gateway
-                    return StatusCode((int)HttpStatusCode.BadGateway, payment);
-                }
-            }
-
-            return BadRequest(payment);
+            var result = await _paymentService.ProcessPaymentAsync(request, cancellationToken);
+            _paymentsRepository.Add(result);
+            return Ok(result);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (HttpRequestException ex)
         {
-            return StatusCode(499, payment); // client closed request
-        }
-        catch (Exception e)
-        {
-            // our error
-            string message = $"An error occurred. Payment ID: {payment.Id}";
-            _logger.LogError(e, message);
-
-            return StatusCode((int)HttpStatusCode.InternalServerError, payment);
-        }
-        finally
-        {
-            // even failures should be stored for record purposes
-            payment.Timestamp = DateTimeOffset.UtcNow;
-            _paymentsRepository.Add(payment);
+            // Bank is unreachable or returned a network-level error. Return 502 so the
+            // client knows the failure is upstream, not in our validation or logic.
+            _logger.LogError(ex, "Bank communication failure while processing payment");
+            return StatusCode(StatusCodes.Status502BadGateway);
         }
     }
+
+    /// <summary>
+    /// Builds a Rejected response for invalid requests. Guards against null/short card
+    /// numbers since model binding runs before validation — the action still executes
+    /// because we suppressed the automatic ModelState invalid filter.
+    /// </summary>
+    private static PostPaymentResponse BuildRejectedResponse(PostPaymentRequest request) => new()
+    {
+        Id = Guid.NewGuid(),
+        Status = PaymentStatus.Rejected,
+        CardNumberLastFour = request.CardNumber?.Length >= 4
+            ? request.CardNumber[^4..]
+            : request.CardNumber ?? string.Empty,
+        ExpiryMonth = request.ExpiryMonth,
+        ExpiryYear = request.ExpiryYear,
+        Currency = request.Currency ?? string.Empty,
+        Amount = request.Amount
+    };
 }

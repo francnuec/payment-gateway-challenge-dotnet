@@ -35,42 +35,65 @@ public class PaymentServiceTests
         return new PaymentService(client, NullLogger<PaymentService>.Instance);
     }
 
+    private static MockHttpMessageHandler MockBankResponse(HttpStatusCode status, bool? authorized = null)
+    {
+        return new MockHttpMessageHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(status)
+            {
+                Content = authorized.HasValue
+                    ? JsonContent.Create(new BankPaymentResponse
+                    {
+                        Authorized = authorized.Value,
+                        AuthorizationCode = authorized.Value ? Guid.NewGuid().ToString() : null
+                    })
+                    : null
+            }));
+    }
+
     [Fact]
     public async Task ProcessPayment_WhenBankAuthorizes_ReturnsAuthorized()
     {
-        var handler = new MockHttpMessageHandler((_, _) =>
-            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = JsonContent.Create(new BankPaymentResponse
-                {
-                    Authorized = true,
-                    AuthorizationCode = Guid.NewGuid().ToString()
-                })
-            }));
+        // Arrange
+        var service = CreateService(MockBankResponse(HttpStatusCode.OK, authorized: true));
 
-        var service = CreateService(handler);
+        // Act
         var result = await service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None);
 
+        // Assert
         Assert.Equal(PaymentStatus.Authorized, result.Status);
     }
 
     [Fact]
     public async Task ProcessPayment_WhenBankDeclines_ReturnsDeclined()
     {
+        // Arrange
+        var service = CreateService(MockBankResponse(HttpStatusCode.OK, authorized: false));
+
+        // Act
+        var result = await service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None);
+
+        // Assert
+        Assert.Equal(PaymentStatus.Declined, result.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPayment_WhenBankReturnsUnparseableBody_ReturnsDeclined()
+    {
+        // Bank returns 200 but with a body that throws JsonException during deserialization.
+        // PaymentService catches this and falls back to Declined (authorized defaults to false).
+
+        // Arrange
         var handler = new MockHttpMessageHandler((_, _) =>
             Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = JsonContent.Create(new BankPaymentResponse
-                {
-                    Authorized = false,
-                    AuthorizationCode = null
-                })
+                Content = new StringContent("not json")
             }));
-
         var service = CreateService(handler);
-        var result = await service.ProcessPaymentAsync(
-            CreateValidRequest("2222405343248112"), CancellationToken.None);
 
+        // Act
+        var result = await service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None);
+
+        // Assert
         Assert.Equal(PaymentStatus.Declined, result.Status);
     }
 
@@ -79,14 +102,13 @@ public class PaymentServiceTests
     {
         // Bank server errors (e.g., 503) are surfaced as BankErrorException so the
         // controller can return 502 Bad Gateway to the client.
-        var handler = new MockHttpMessageHandler((_, _) =>
-            Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)));
 
-        var service = CreateService(handler);
+        // Arrange
+        var service = CreateService(MockBankResponse(HttpStatusCode.ServiceUnavailable));
 
+        // Act & Assert
         var ex = await Assert.ThrowsAsync<BankErrorException>(
-            () => service.ProcessPaymentAsync(
-                CreateValidRequest("2222405343248870"), CancellationToken.None));
+            () => service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None));
 
         Assert.Equal(503, ex.StatusCode);
     }
@@ -96,11 +118,11 @@ public class PaymentServiceTests
     {
         // Bank client errors (e.g., 400) are surfaced as BankErrorException so the
         // controller can return 400 Bad Request to the client.
-        var handler = new MockHttpMessageHandler((_, _) =>
-            Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)));
 
-        var service = CreateService(handler);
+        // Arrange
+        var service = CreateService(MockBankResponse(HttpStatusCode.BadRequest));
 
+        // Act & Assert
         var ex = await Assert.ThrowsAsync<BankErrorException>(
             () => service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None));
 
@@ -111,13 +133,13 @@ public class PaymentServiceTests
     public async Task ProcessPayment_WhenBankUnreachable_ThrowsHttpRequestException()
     {
         // Network failures propagate to the controller, which returns 502 Bad Gateway.
-        // This separation lets the controller decide the HTTP semantics while the service
-        // stays focused on business logic.
+
+        // Arrange
         var handler = new MockHttpMessageHandler((_, _) =>
             throw new HttpRequestException("Connection refused"));
-
         var service = CreateService(handler);
 
+        // Act & Assert
         await Assert.ThrowsAsync<HttpRequestException>(
             () => service.ProcessPaymentAsync(CreateValidRequest(), CancellationToken.None));
     }
@@ -126,16 +148,15 @@ public class PaymentServiceTests
     public async Task ProcessPayment_MapsAllRequiredResponseFields()
     {
         // Verify every field required by the spec: id, status, last_four, expiry, currency, amount.
-        var handler = new MockHttpMessageHandler((_, _) =>
-            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = JsonContent.Create(new BankPaymentResponse { Authorized = true })
-            }));
 
-        var service = CreateService(handler);
+        // Arrange
+        var service = CreateService(MockBankResponse(HttpStatusCode.OK, authorized: true));
         var request = CreateValidRequest();
+
+        // Act
         var result = await service.ProcessPaymentAsync(request, CancellationToken.None);
 
+        // Assert
         Assert.NotEqual(Guid.Empty, result.Id);
         Assert.Equal(PaymentStatus.Authorized, result.Status);
         Assert.Equal("8877", result.CardNumberLastFour);

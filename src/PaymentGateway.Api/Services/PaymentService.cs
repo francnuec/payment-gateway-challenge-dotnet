@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 
 using PaymentGateway.Api.Models;
 using PaymentGateway.Api.Models.Requests;
@@ -72,8 +73,19 @@ public class PaymentService : IPaymentService
             throw new BankErrorException(bankStatusCode);
         }
 
-        var content = await bankResponse.Content
-            .ReadFromJsonAsync<BankPaymentResponse>(cancellationToken);
+        BankPaymentResponse? content = null;
+        try
+        {
+            content = await bankResponse.Content
+                .ReadFromJsonAsync<BankPaymentResponse>(cancellationToken);
+        }
+        catch (JsonException ex)
+        {
+            // Unparseable body (malformed JSON, empty content, wrong schema, etc.)
+            // is treated as non-authorized. The bank's response is logged so we can
+            // investigate any unexpected format changes.
+            _logger.LogWarning(ex, "Bank returned 200 but response body could not be parsed; treating as Declined");
+        }
 
         var status = content?.Authorized == true
             ? PaymentStatus.Authorized

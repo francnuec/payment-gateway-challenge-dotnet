@@ -61,12 +61,16 @@ public class PaymentsControllerIntegrationTests
     public async Task PostPayment_WithAuthorizedCard_Returns200WithAuthorized()
     {
         // Card ending in 7 (odd) -> bank returns authorized=true
+
+        // Arrange
         var client = CreateClient();
         var request = CreateValidRequest("2222405343248877");
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
         var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.NotNull(payment);
         Assert.Equal(PaymentStatus.Authorized, payment!.Status);
@@ -83,12 +87,16 @@ public class PaymentsControllerIntegrationTests
     public async Task PostPayment_WithDeclinedCard_Returns200WithDeclined()
     {
         // Card ending in 2 (even) -> bank returns authorized=false
+
+        // Arrange
         var client = CreateClient();
         var request = CreateValidRequest("2222405343248112");
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
         var payment = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.NotNull(payment);
         Assert.Equal(PaymentStatus.Declined, payment!.Status);
@@ -105,11 +113,15 @@ public class PaymentsControllerIntegrationTests
     {
         // Card ending in 0 -> bank returns 503. The gateway surfaces this as 502
         // because the failure is upstream — the client should retry later.
+
+        // Arrange
         var client = CreateClient();
         var request = CreateValidRequest("2222405343248870");
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
 
+        // Assert
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
     }
 
@@ -118,12 +130,16 @@ public class PaymentsControllerIntegrationTests
     {
         // Card starting with "0" -> bank returns 400 (test-only simulator rule).
         // The gateway relays this as 400 Bad Request with a Rejected status.
+
+        // Arrange
         var client = CreateClient();
         var request = CreateValidRequest("01234567890123");
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
         var result = await response.Content.ReadFromJsonAsync<PaymentResponseBase>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.NotNull(result);
         Assert.Equal(PaymentStatus.Rejected, result!.Status);
@@ -146,6 +162,7 @@ public class PaymentsControllerIntegrationTests
     public async Task PostPayment_WithInvalidData_Returns400WithRejectedAndErrors(
         string cardNumber, string currency, string cvv)
     {
+        // Arrange
         var client = CreateClient();
         var request = new PostPaymentRequest
         {
@@ -157,9 +174,11 @@ public class PaymentsControllerIntegrationTests
             Cvv = cvv
         };
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
         var result = await response.Content.ReadFromJsonAsync<PaymentResponseBase>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.NotNull(result);
         Assert.Equal(PaymentStatus.Rejected, result!.Status);
@@ -170,6 +189,7 @@ public class PaymentsControllerIntegrationTests
     [Fact]
     public async Task PostPayment_WithExpiredDate_Returns400WithRejectedAndErrors()
     {
+        // Arrange
         var client = CreateClient();
         var request = new PostPaymentRequest
         {
@@ -181,9 +201,11 @@ public class PaymentsControllerIntegrationTests
             Cvv = "123"
         };
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
         var result = await response.Content.ReadFromJsonAsync<PaymentResponseBase>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.NotNull(result);
         Assert.Equal(PaymentStatus.Rejected, result!.Status);
@@ -197,6 +219,8 @@ public class PaymentsControllerIntegrationTests
         // Rejected responses should only have status + errors, not payment-specific
         // fields like id, card_number_last_four, etc. Deserializing as PostPaymentResponse
         // should leave those fields at their defaults.
+
+        // Arrange
         var client = CreateClient();
         var request = new PostPaymentRequest
         {
@@ -208,9 +232,11 @@ public class PaymentsControllerIntegrationTests
             Cvv = "123"
         };
 
+        // Act
         var response = await client.PostAsJsonAsync("/api/Payments", request);
         var result = await response.Content.ReadFromJsonAsync<PostPaymentResponse>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.NotNull(result);
         // These fields should be absent from a rejected response (defaults for their types)
@@ -229,16 +255,19 @@ public class PaymentsControllerIntegrationTests
     {
         // Round-trip test: POST a payment, then GET it back by ID.
         // Verifies the full write-then-read path through the pipeline.
+
+        // Arrange
         var client = CreateClient();
         var request = CreateValidRequest();
-
         var postResponse = await client.PostAsJsonAsync("/api/Payments", request);
         var posted = await postResponse.Content.ReadFromJsonAsync<PostPaymentResponse>();
         Assert.NotNull(posted);
 
+        // Act
         var getResponse = await client.GetAsync($"/api/Payments/{posted!.Id}");
         var retrieved = await getResponse.Content.ReadFromJsonAsync<PostPaymentResponse>();
 
+        // Assert
         Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
         Assert.NotNull(retrieved);
         Assert.Equal(posted.Id, retrieved!.Id);
@@ -254,10 +283,29 @@ public class PaymentsControllerIntegrationTests
     [Fact]
     public async Task GetPayment_WithNonExistentId_Returns404()
     {
+        // Arrange
         var client = CreateClient();
 
+        // Act
         var response = await client.GetAsync($"/api/Payments/{Guid.NewGuid()}");
 
+        // Assert
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task GetPayment_WithInvalidGuidFormat_Returns404()
+    {
+        // The {id:guid} route constraint rejects non-GUID segments before the
+        // controller is reached, so the response is 404 Not Found (no route match).
+
+        // Arrange
+        var client = CreateClient();
+
+        // Act
+        var response = await client.GetAsync("/api/Payments/not-a-guid");
+
+        // Assert
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 }

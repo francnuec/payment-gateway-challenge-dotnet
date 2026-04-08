@@ -11,7 +11,7 @@ public class PostPaymentRequest
     [Length(14, 19)]
     [RegularExpression(@"^\d+$", ErrorMessage = "Only numbers allowed.")]
     [JsonPropertyName("card_number")]
-    public string CardNumber { get; set; }
+    public string CardNumber { get; set; } = string.Empty;
 
     [Required]
     [Range(1, 12)]
@@ -27,7 +27,7 @@ public class PostPaymentRequest
     [Length(3, 3)]
     [AllowedValues("EUR", "GBP", "USD", ErrorMessage = "Only EUR, GBP, or USD allowed.")]
     [JsonPropertyName("currency")]
-    public string Currency { get; set; }
+    public string Currency { get; set; } = string.Empty;
 
     [Required]
     [JsonPropertyName("amount")]
@@ -37,5 +37,5 @@ public class PostPaymentRequest
     [Length(3, 4)]
     [RegularExpression(@"^\d+$", ErrorMessage = "Only numbers allowed.")]
     [JsonPropertyName("cvv")]
-    public string Cvv { get; set; }
+    public string Cvv { get; set; } = string.Empty;
 }

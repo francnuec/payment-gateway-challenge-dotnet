@@ -27,7 +27,7 @@ The solution separates concerns into three layers:
 
 - **Controller** — Handles HTTP semantics only: model validation, status code mapping, and request/response serialisation. Contains no business logic.
 - **PaymentService** — Owns the bank communication workflow: request transformation, HTTP calls, response interpretation, and error logging. Injected via `IPaymentService` for testability.
-- **PaymentsRepository** — Abstracts storage behind `IPaymentsRepository`. Uses `ConcurrentDictionary<Guid, PostPaymentResponse>` for thread-safe, O(1) lookups. In production this interface would be backed by a database with a scoped lifetime.
+- **PaymentsRepository** — Abstracts storage behind `IPaymentsRepository`. Uses `ConcurrentDictionary<Guid, PostPaymentResponse>` for thread-safe lookups. In production this interface would be backed by a database with a scoped lifetime.
 
 This separation was chosen over a single-controller approach because it allows each layer to be tested independently and makes the codebase easier to navigate during a review.
 
@@ -77,12 +77,12 @@ Structured logging uses semantic parameter names (`{PaymentId}`, `{BankStatusCod
 - **Alerting** — Spike in bank 5xx, latency exceeding SLA thresholds
 - **Distributed tracing** — Correlation across gateway and bank calls via OpenTelemetry
 
-## Testing Strategy
+## Testing
 
-The test suite has 29 tests across two categories:
+There are two categories of tests:
 
-- **Unit tests (14)** — Test `PaymentService`, `PaymentsRepository`, and `FutureDateAttribute` in isolation with no I/O. Bank HTTP responses are controlled via a `MockHttpMessageHandler`. These run in milliseconds and give fast feedback during development.
-- **Integration tests (15)** — Verify the full HTTP pipeline (routing → validation → service → repository → serialisation) using `WebApplicationFactory`. A `BankSimulatorHandler` replicates the mountebank rules in-process, so tests run without Docker.
+- **Unit tests** — Test `PaymentService`, `PaymentsRepository`, and `FutureDateAttribute` in isolation with no I/O. Bank HTTP responses are controlled via a `MockHttpMessageHandler`. These run in milliseconds and give fast feedback during development.
+- **Integration tests** — Verify the full HTTP pipeline (routing → validation → service → repository → serialisation) using `WebApplicationFactory`. A `BankSimulatorHandler` replicates the mountebank rules in-process, so tests run without Docker.
 
 This split is deliberate: unit tests catch logic regressions quickly, while integration tests catch wiring issues (missing DI registrations, serialisation mismatches, incorrect route templates) that unit tests cannot.
 

@@ -85,5 +85,11 @@ public class PaymentsController : ControllerBase
             // Bank 5xx or network failure — already logged by PaymentService.
             return StatusCode(StatusCodes.Status502BadGateway);
         }
+        catch(Exception ex)
+        {
+            // Catch-all for any unexpected exceptions.
+            _logger.LogError(ex, "Unexpected error processing payment");
+            return StatusCode(StatusCodes.Status500InternalServerError);
+        }
     }
 }
